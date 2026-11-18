@@ -16,12 +16,66 @@ library(purrr)
 ```
 
 ```{r}
-imdb_snapshots <- read_rds("data/imdb_snapshots.rds")
+#| cache: true
 
-imdb_snapshots
+urls <- c(
+  "https://web.archive.org/web/20150101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20170101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20190101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20210101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20220201012049/https://www.imdb.com/chart/top/"
+)
 
-imdb_snapshots |>
-  count(snap_year)
+years <- c(2015, 2017, 2019, 2021, 2022)
+
+scrape_imdb <- function(url, snap_year) {
+  tryCatch(
+    {
+      response <- request(url) |>
+        req_timeout(30) |>
+        req_retry(max_tries = 3) |>
+        req_perform()
+
+      table_node <- resp_body_html(response) |>
+        html_element("table")
+      imdb_table <- html_table(table_node, convert = FALSE)
+
+      parsed_title <- str_match(
+        str_squish(imdb_table[["Rank & Title"]]),
+        "^(\\d+)\\.\\s*(.*?)\\s*\\((\\d{4})\\)$"
+      )
+      title_attr <- table_node |>
+        html_elements("td.ratingColumn.imdbRating strong, td.imdbRating strong") |>
+        html_attr("title")
+      number <- title_attr |>
+        str_extract("(?<=based on )[0-9,]+") |>
+        str_remove_all(",") |>
+        as.integer()
+
+      result <- tibble(
+        snap_year = as.integer(snap_year),
+        rank = as.integer(parsed_title[, 2]),
+        title = parsed_title[, 3],
+        year = as.integer(parsed_title[, 4]),
+        rating = readr::parse_number(imdb_table[["IMDb Rating"]]),
+        number = number
+      )
+
+      if (nrow(result) != 250L) {
+        stop("Expected 250 rows from the IMDb chart; received ", nrow(result), ".")
+      }
+
+      result
+    },
+    error = \(error) {
+      message("Could not scrape the ", snap_year, " IMDb snapshot: ", conditionMessage(error))
+      NULL
+    }
+  )
+}
+
+imdb_snapshots <- map2(urls, years, scrape_imdb) |>
+  list_rbind()
 ```
 
 ```{r}
@@ -33,4 +87,59 @@ imdb_snapshots |>
   mutate(rank_change = abs(rank_2015 - rank_2022)) |>
   arrange(desc(rank_change)) |>
   slice_head(n = 10)
+```
+
+```{r}
+imdb_snapshots |>
+  filter(snap_year %in% c(2015, 2022)) |>
+  select(title, year, snap_year, rank) |>
+  pivot_wider(names_from = snap_year, values_from = rank, names_prefix = "rank_") |>
+  drop_na(rank_2015, rank_2022) |>
+  mutate(
+    release_decade = floor(year / 10) * 10,
+    rank_change = abs(rank_2015 - rank_2022)
+  ) |>
+  group_by(release_decade) |>
+  summarize(avg_rank_change = mean(rank_change), .groups = "drop") |>
+  arrange(release_decade)
+```
+
+```{r}
+imdb_snapshots |>
+  count(title, name = "n_snapshots") |>
+  count(n_snapshots)
+```
+
+```{r}
+rank_change_by_decade <- imdb_snapshots |>
+  filter(snap_year %in% c(2015, 2022)) |>
+  select(title, year, snap_year, rank) |>
+  pivot_wider(names_from = snap_year, values_from = rank, names_prefix = "rank_") |>
+  drop_na(rank_2015, rank_2022) |>
+  mutate(
+    rank_change = rank_2015 - rank_2022,
+    release_decade = floor(year / 10) * 10
+  ) |>
+  group_by(release_decade) |>
+  summarize(avg_rank_change = mean(rank_change), .groups = "drop") |>
+  arrange(release_decade) |>
+  mutate(
+    direction = if_else(avg_rank_change > 0, "Rose", "Fell"),
+    release_decade = factor(release_decade, levels = sort(unique(release_decade)))
+  )
+
+ggplot(rank_change_by_decade, aes(x = avg_rank_change, y = release_decade, fill = direction)) +
+  geom_col() +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_fill_manual(
+    values = c("Rose" = "#2C7FB8", "Fell" = "#D95F0E")
+  ) +
+  labs(
+    title = "Average IMDb Rank Change by Release Decade",
+    subtitle = "Positive values indicate films rose in the rankings from 2015 to 2022",
+    x = "Average signed rank change (2015 rank - 2022 rank)",
+    y = "Release decade",
+    fill = "Direction",
+    caption = "190 films appear in both the 2015 and 2022 snapshots"
+  )
 ```
